@@ -49,7 +49,7 @@ strip(#xmlElement{content = Kids} = Elem) ->
 %%      the element with the signature added.
 %%
 %% Don't use "ds" as a namespace prefix in the envelope document, or things will go baaaad.
--spec sign(Element :: #xmlElement{}, PrivateKey :: #'RSAPrivateKey'{}, CertBin :: binary()) -> #xmlElement{}.
+-spec sign(Element :: #xmlElement{} | tuple(), PrivateKey :: #'RSAPrivateKey'{}, CertBin :: binary()) -> #xmlElement{}.
 sign(ElementIn, PrivateKey = #'RSAPrivateKey'{}, CertBin) when is_binary(CertBin) ->
     sign(ElementIn, PrivateKey, CertBin, "http://www.w3.org/2000/09/xmldsig#rsa-sha1").
 
@@ -79,6 +79,7 @@ sign_element(ElementIn, SigMethod) ->
                                         ElementStrip#xmlElement.attributes],
                             Elem = ElementStrip#xmlElement{attributes = NewAttrs},
                             {Elem, NewId}
+                    end
             end
     end,
 
@@ -197,7 +198,8 @@ sign(ElementIn, PrivateKey = #'RSAPrivateKey'{}, CertBin, SigMethod) when is_bin
         ]
     }),
 
-    Element#xmlElement{content = [SigElem | Element#xmlElement.content]}.
+    %Element#xmlElement{content = [SigElem | Element#xmlElement.content]}.
+    SigElem.
 
 %% @doc Returns the canonical digest of an (optionally signed) element
 %%
