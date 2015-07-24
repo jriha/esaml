@@ -53,32 +53,116 @@ strip(#xmlElement{content = Kids} = Elem) ->
 sign(ElementIn, PrivateKey = #'RSAPrivateKey'{}, CertBin) when is_binary(CertBin) ->
     sign(ElementIn, PrivateKey, CertBin, "http://www.w3.org/2000/09/xmldsig#rsa-sha1").
 
--spec sign(Element :: #xmlElement{}, PrivateKey :: #'RSAPrivateKey'{}, CertBin :: binary(), SignatureMethod :: sig_method() | sig_method_uri()) -> #xmlElement{}.
-sign(ElementIn, PrivateKey = #'RSAPrivateKey'{}, CertBin, SigMethod) when is_binary(CertBin) ->
+sign_element(ElementIn, SigMethod) ->
     % get rid of any previous signature
     ElementStrip = strip(ElementIn),
 
     % make sure the root element has an ID... if it doesn't yet, add one
-    {Element, Id} = case lists:keyfind('ID', 2, ElementStrip#xmlElement.attributes) of
+    {Element, Id} =
+        case lists:keyfind('ID', 2,
+                           ElementStrip#xmlElement.attributes) of
         #xmlAttribute{value = CapId} -> {ElementStrip, CapId};
         _ ->
-            case lists:keyfind('id', 2, ElementStrip#xmlElement.attributes) of
-                #xmlAttribute{value = LowId} -> {ElementStrip, LowId};
+            case lists:keyfind('Id', 2,
+                               ElementStrip#xmlElement.attributes) of
+                #xmlAttribute{value = CamelId} -> {ElementStrip, CamelId};
                 _ ->
-                    NewId = uuid:to_string(uuid:uuid1()),
-                    Attr = #xmlAttribute{name = 'ID', value = NewId, namespace = #xmlNamespace{}},
-                    NewAttrs = [Attr | ElementStrip#xmlElement.attributes],
-                    Elem = ElementStrip#xmlElement{attributes = NewAttrs},
-                    {Elem, NewId}
+                    case lists:keyfind('id', 2,
+                                       ElementStrip#xmlElement.attributes) of
+                        #xmlAttribute{value = LowId} -> {ElementStrip, LowId};
+                        _ ->
+                            NewId = uuid:to_string(uuid:uuid1()),
+                            Attr = #xmlAttribute{name = 'ID',
+                                                 value = NewId,
+                                                 namespace = #xmlNamespace{}},
+                            NewAttrs = [Attr |
+                                        ElementStrip#xmlElement.attributes],
+                            Elem = ElementStrip#xmlElement{attributes = NewAttrs},
+                            {Elem, NewId}
             end
     end,
 
-    {HashFunction, DigestMethod, SignatureMethodAlgorithm} = signature_props(SigMethod),
+    {HashFunction, DigestMethod, _SignatureMethodAlgorithm} = signature_props(SigMethod),
 
-    % first we need the digest, to generate our SignedInfo element
+    %% We need the digest, to generate our Reference element
     CanonXml = xmerl_c14n:c14n(Element),
     DigestValue = base64:encode_to_string(
         crypto:hash(HashFunction, unicode:characters_to_binary(CanonXml, unicode, utf8))),
+
+    #xmlElement{
+       name = 'ds:Reference',
+       attributes = [#xmlAttribute{name = 'URI', value = lists:flatten(["#" | Id])}],
+       content =
+           [#xmlElement{
+               name = 'ds:Transforms',
+               content =
+                   [#xmlElement{
+                       name = 'ds:Transform',
+                       attributes =
+                           [#xmlAttribute{
+                               name = 'Algorithm',
+                               value = "http://www.w3.org/2000/09/" ++
+                                       "xmldsig#enveloped-signature"}]},
+                    #xmlElement{
+                       name = 'ds:Transform',
+                       attributes =
+                           [#xmlAttribute{
+                               name = 'Algorithm',
+                               value = "http://www.w3.org/2001/10/" ++
+                                       "xml-exc-c14n#"}]}]},
+            #xmlElement{
+               name = 'ds:DigestMethod',
+               attributes = [#xmlAttribute{name = 'Algorithm',
+                                           value = DigestMethod}]},
+            #xmlElement{
+               name = 'ds:DigestValue',
+               content = [#xmlText{value = DigestValue}]}
+           ]}.
+
+-spec sign(Elements :: #xmlElement{} | tuple(), PrivateKey :: #'RSAPrivateKey'{}, CertBin :: binary(), SignatureMethod :: sig_method() | sig_method_uri()) -> #xmlElement{}.
+sign({multiple, Elements}, PrivateKey = #'RSAPrivateKey'{}, CertBin, SigMethod) when is_binary(CertBin) ->
+    {HashFunction, _DigestMethod, SignatureMethodAlgorithm} = signature_props(SigMethod),
+
+    References = lists:map(fun (Element) ->
+                             sign_element(Element, SigMethod)
+                           end, Elements),
+
+    Ns = #xmlNamespace{nodes = [{"ds", 'http://www.w3.org/2000/09/xmldsig#'}]},
+    SigInfo = esaml_util:build_nsinfo(Ns, #xmlElement{
+        name = 'ds:SignedInfo',
+        content = [
+            #xmlElement{name = 'ds:CanonicalizationMethod',
+                attributes = [#xmlAttribute{name = 'Algorithm', value = "http://www.w3.org/2001/10/xml-exc-c14n#"}]},
+            #xmlElement{name = 'ds:SignatureMethod',
+                attributes = [#xmlAttribute{name = 'Algorithm', value = SignatureMethodAlgorithm}]} |
+            References
+        ]
+    }),
+
+    % now we sign the SignedInfo element...
+    SigInfoCanon = xmerl_c14n:c14n(SigInfo),
+    Data = unicode:characters_to_binary(SigInfoCanon, unicode, utf8),
+
+    Signature = public_key:sign(Data, HashFunction, PrivateKey),
+    Sig64 = base64:encode_to_string(Signature),
+    Cert64 = base64:encode_to_string(CertBin),
+
+    %% Return the Signature Element if multiple Elements were signed
+    esaml_util:build_nsinfo(Ns, #xmlElement{
+        name = 'ds:Signature',
+        attributes = [#xmlAttribute{name = 'xmlns:ds', value = "http://www.w3.org/2000/09/xmldsig#"}],
+        content = [
+            SigInfo,
+            #xmlElement{name = 'ds:SignatureValue', content = [#xmlText{value = Sig64}]},
+            #xmlElement{name = 'ds:KeyInfo', content = [
+                #xmlElement{name = 'ds:X509Data', content = [
+                    #xmlElement{name = 'ds:X509Certificate', content = [#xmlText{value = Cert64} ]}]}]}
+        ]
+    });
+sign(ElementIn, PrivateKey = #'RSAPrivateKey'{}, CertBin, SigMethod) when is_binary(CertBin) ->
+    {HashFunction, _DigestMethod, SignatureMethodAlgorithm} = signature_props(SigMethod),
+
+    Reference = sign_element(ElementIn, SigMethod),
 
     Ns = #xmlNamespace{nodes = [{"ds", 'http://www.w3.org/2000/09/xmldsig#'}]},
     SigInfo = esaml_util:build_nsinfo(Ns, #xmlElement{
@@ -88,19 +172,7 @@ sign(ElementIn, PrivateKey = #'RSAPrivateKey'{}, CertBin, SigMethod) when is_bin
                 attributes = [#xmlAttribute{name = 'Algorithm', value = "http://www.w3.org/2001/10/xml-exc-c14n#"}]},
             #xmlElement{name = 'ds:SignatureMethod',
                 attributes = [#xmlAttribute{name = 'Algorithm', value = SignatureMethodAlgorithm}]},
-            #xmlElement{name = 'ds:Reference',
-                attributes = [#xmlAttribute{name = 'URI', value = lists:flatten(["#" | Id])}],
-                content = [
-                    #xmlElement{name = 'ds:Transforms', content = [
-                        #xmlElement{name = 'ds:Transform',
-                            attributes = [#xmlAttribute{name = 'Algorithm', value = "http://www.w3.org/2000/09/xmldsig#enveloped-signature"}]},
-                        #xmlElement{name = 'ds:Transform',
-                            attributes = [#xmlAttribute{name = 'Algorithm', value = "http://www.w3.org/2001/10/xml-exc-c14n#"}]}]},
-                    #xmlElement{name = 'ds:DigestMethod',
-                        attributes = [#xmlAttribute{name = 'Algorithm', value = DigestMethod}]},
-                    #xmlElement{name = 'ds:DigestValue',
-                        content = [#xmlText{value = DigestValue}]}
-                ]}
+            Reference
         ]
     }),
 
