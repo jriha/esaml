@@ -50,6 +50,34 @@ strip(#xmlElement{content = Kids} = Elem) ->
     end, Kids),
     Elem#xmlElement{content = NewKids}.
 
+%% @doc Reads the ID of an element, if its missing it will generate a new ID
+get_element_id(Element) ->
+    case lists:keyfind('ID', 2,
+                       Element#xmlElement.attributes) of
+        #xmlAttribute{value = CapId} ->
+            {Element, CapId};
+        _ ->
+            case lists:keyfind('Id', 2,
+                               Element#xmlElement.attributes) of
+                #xmlAttribute{value = CamelId} -> {Element, CamelId};
+                _ ->
+                    case lists:keyfind('id', 2,
+                                       Element#xmlElement.attributes) of
+                        #xmlAttribute{value = LowId} -> {Element, LowId};
+                        _ ->
+                            NewId = uuid:to_string(uuid:uuid1()),
+                            Attr = #xmlAttribute{name = 'ID',
+                                                 value = NewId,
+                                                 namespace = #xmlNamespace{}},
+                            NewAttrs = [Attr |
+                                        Element#xmlElement.attributes],
+                            Elem = Element#xmlElement{attributes = NewAttrs},
+                            {Elem, NewId}
+                    end
+            end
+    end.
+
+
 %% @doc Signs the given XML element by creating a ds:Signature element within it, returning
 %%      the element with the signature added.
 %%
@@ -63,30 +91,7 @@ sign_element(ElementIn, SigMethod) ->
     ElementStrip = strip(ElementIn),
 
     % make sure the root element has an ID... if it doesn't yet, add one
-    {Element, Id} =
-        case lists:keyfind('ID', 2,
-                           ElementStrip#xmlElement.attributes) of
-        #xmlAttribute{value = CapId} -> {ElementStrip, CapId};
-        _ ->
-            case lists:keyfind('Id', 2,
-                               ElementStrip#xmlElement.attributes) of
-                #xmlAttribute{value = CamelId} -> {ElementStrip, CamelId};
-                _ ->
-                    case lists:keyfind('id', 2,
-                                       ElementStrip#xmlElement.attributes) of
-                        #xmlAttribute{value = LowId} -> {ElementStrip, LowId};
-                        _ ->
-                            NewId = uuid:to_string(uuid:uuid1()),
-                            Attr = #xmlAttribute{name = 'ID',
-                                                 value = NewId,
-                                                 namespace = #xmlNamespace{}},
-                            NewAttrs = [Attr |
-                                        ElementStrip#xmlElement.attributes],
-                            Elem = ElementStrip#xmlElement{attributes = NewAttrs},
-                            {Elem, NewId}
-                    end
-            end
-    end,
+    {Element, Id} = get_element_id(ElementStrip),
 
     {HashFunction, DigestMethod, _SignatureMethodAlgorithm} = signature_props(SigMethod),
 
@@ -152,19 +157,46 @@ sign({multiple, Elements}, PrivateKey = #'RSAPrivateKey'{}, CertBin, SigMethod) 
     Signature = public_key:sign(Data, HashFunction, PrivateKey),
     Sig64 = base64:encode_to_string(Signature),
     Cert64 = base64:encode_to_string(CertBin),
-
+    CertId = "CertId",
     %% Return the Signature Element if multiple Elements were signed
-    esaml_util:build_nsinfo(Ns, #xmlElement{
-        name = 'ds:Signature',
-        attributes = [#xmlAttribute{name = 'xmlns:ds', value = "http://www.w3.org/2000/09/xmldsig#"}],
-        content = [
-            SigInfo,
-            #xmlElement{name = 'ds:SignatureValue', content = [#xmlText{value = Sig64}]},
-            #xmlElement{name = 'ds:KeyInfo', content = [
-                #xmlElement{name = 'ds:X509Data', content = [
-                    #xmlElement{name = 'ds:X509Certificate', content = [#xmlText{value = Cert64} ]}]}]}
-        ]
-    });
+    esaml_util:build_nsinfo(Ns,
+        [#xmlElement{
+            name = 'ds:Signature',
+            attributes = [#xmlAttribute{name = 'xmlns:ds', value = "http://www.w3.org/2000/09/xmldsig#"}],
+            content = [
+                SigInfo,
+                #xmlElement{name = 'ds:SignatureValue', content = [#xmlText{value = Sig64}]},
+                #xmlElement{name = 'ds:KeyInfo',
+                    content = [
+                    #xmlElement{name = 'wsse:SecurityTokenReference',
+                        attributes =
+                            [#xmlAttribute{
+                                 name = 'xmlns:wsu',
+                                 value = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"}],
+                        content = [
+                            #xmlElement{name = 'wsse:Reference',
+                                attributes =
+                                    [#xmlAttribute{
+                                         name = 'URI',
+                                         value = "#" ++ CertId},
+                                     #xmlAttribute{
+                                         name = 'ValueType',
+                                         value = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3"}]}]}]}]},
+        #xmlElement{name = 'wsse:BinarySecurityToken',
+           attributes =
+               [#xmlAttribute{
+                   name = 'xmlns:wsu',
+                   value = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"},
+                #xmlAttribute{
+                   name = 'EncodingType',
+                   value = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary"},
+                #xmlAttribute{
+                   name = 'ValueType',
+                   value = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3"},
+                #xmlAttribute{
+                   name = 'wsu:Id',
+                   value = CertId}],
+            content = [#xmlText{value = Cert64}]}]);
 sign(ElementIn, PrivateKey = #'RSAPrivateKey'{}, CertBin, SigMethod) when is_binary(CertBin) ->
     {HashFunction, _DigestMethod, SignatureMethodAlgorithm} = signature_props(SigMethod),
 
@@ -203,8 +235,10 @@ sign(ElementIn, PrivateKey = #'RSAPrivateKey'{}, CertBin, SigMethod) when is_bin
         ]
     }),
 
-    %Element#xmlElement{content = [SigElem | Element#xmlElement.content]}.
-    SigElem.
+    ElementStrip = strip(ElementIn),
+    {Element, _Id} = get_element_id(ElementStrip),
+
+    Element#xmlElement{content = [SigElem | Element#xmlElement.content]}.
 
 %% @doc Returns the canonical digest of an (optionally signed) element
 %%
